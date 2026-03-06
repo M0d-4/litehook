@@ -173,11 +173,11 @@ const char *litehook_locate_dsc(void)
 			strlcpy(dscPath, dyldSharedCacheDir, PATH_MAX);
 			strlcat(dscPath, "/dyld_shared_cache", PATH_MAX);
 		}
-		else if (!access("/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld", F_OK)) /* iOS >=16 */ {
-			strlcpy(dscPath, "/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache", PATH_MAX);
-		}
 		else if (!access("/System/Library/Caches/com.apple.dyld", F_OK)) /* iOS <=15 */ {
 			strlcpy(dscPath, "/System/Library/Caches/com.apple.dyld/dyld_shared_cache", PATH_MAX);
+		}
+		else if (!access("/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld", F_OK)) /* iOS >=16 */ {
+			strlcpy(dscPath, "/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache", PATH_MAX);
 		}
 
 		const char *suffixCandidates[] = {
@@ -484,6 +484,31 @@ void _litehook_rebind_symbol_in_section(const mach_header_u *targetHeader, secti
 	}
 }
 
+static bool _litehook_section_name_equals(const char sectionName[16], const char *name)
+{
+	return !strncmp(sectionName, name, 16);
+}
+
+static bool _litehook_should_rebind_section(const section_u *section)
+{
+	uint32_t sectionType = section->flags & SECTION_TYPE;
+	if (sectionType == S_LAZY_SYMBOL_POINTERS ||
+		sectionType == S_NON_LAZY_SYMBOL_POINTERS) {
+		return true;
+	}
+
+	// Newer dyld/arm64e images may use chained fixups where GOT-like sections
+	// are not marked as lazy/non-lazy symbol pointers.
+	if (_litehook_section_name_equals(section->sectname, "__auth_got") ||
+		_litehook_section_name_equals(section->sectname, "__got") ||
+		_litehook_section_name_equals(section->sectname, "__la_symbol_ptr") ||
+		_litehook_section_name_equals(section->sectname, "__nl_symbol_ptr")) {
+		return true;
+	}
+
+	return false;
+}
+
 uint32_t gRebindCount = 0;
 global_rebind *gRebinds = NULL;
 
@@ -554,8 +579,7 @@ void litehook_rebind_symbol(const mach_header_u *targetHeader, void *replacee, v
 					!strncmp(segCmd->segname, "__DATA", sizeof(segCmd->segname))) {
 					section_u *sections = (void *)((uintptr_t)lcp + sizeof(segment_command_u));
 					for (int j = 0; j < segCmd->nsects; j++) {
-						if ((sections[j].flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS || 
-							(sections[j].flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
+						if (_litehook_should_rebind_section(&sections[j])) {
 							_litehook_rebind_symbol_in_section(targetHeader, &sections[j], replacee, replacement);
 						}
 					}
