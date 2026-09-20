@@ -342,7 +342,7 @@ void *litehook_find_symbol_file(const mach_header_u *header, const char *symbolN
 {
     struct symtab_command *symtabCommand = NULL;
 
-    uint32_t slide = -1;
+    uintptr_t slide = (uintptr_t)-1;
 
     uint32_t off = 0;
     for (uint32_t i = 0; i < header->ncmds && off < header->sizeofcmds; i++) {
@@ -353,7 +353,7 @@ void *litehook_find_symbol_file(const mach_header_u *header, const char *symbolN
         }
         else if (lc->cmd == LC_SEGMENT_U) {
             segment_command_u *segCmd = (segment_command_u *)lc;
-            if (slide == -1) {
+            if (slide == (uintptr_t)-1) {
                 slide = (uintptr_t)header - segCmd->vmaddr;
             }
         }
@@ -387,7 +387,8 @@ void *litehook_find_symbol_file(const mach_header_u *header, const char *symbolN
         }
 
         if (!strcmp(curSymbolName, symbolName)) {
-            return _litehook_sign_if_executable((void *)((uintptr_t)header + symEntry->n_value));
+            if (slide == (uintptr_t)-1) slide = 0;
+            return _litehook_sign_if_executable((void *)((uintptr_t)header + symEntry->n_value), slide, header);
         }
     }
 
