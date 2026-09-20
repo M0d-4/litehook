@@ -136,29 +136,47 @@ kern_return_t litehook_protect(vm_address_t addr, vm_size_t size)
 	return litehook_vm_protect(mach_task_self(), addr, size, false, VM_PROT_READ | VM_PROT_EXECUTE);
 }
 
-kern_return_t litehook_hook_function(void *source, void *target)
+// Simple memcpy reimplementation since we can't have any external dependencies during critical section
+static void litehook_memcpy(void *target, void *source, size_t size)
 {
-	kern_return_t kr = KERN_SUCCESS;
+	uint8_t *targetBytes = target;
+	uint8_t *sourceBytes = source;
+	for (size_t i = 0; i < size; i++) {
+		targetBytes[i] = sourceBytes[i];
+	}
+}
 
-	uint32_t *toHook = (uint32_t*)ptrauth_strip(source, ptrauth_key_function_pointer);
-	uint64_t targetAddr = (uint64_t)ptrauth_strip(target, ptrauth_key_function_pointer);
-
-	kr = litehook_unprotect((vm_address_t)toHook, 5*4);
+kern_return_t litehook_hook_memory_default(void *target, void *source, size_t sourceSize)
+{
+	kern_return_t kr = litehook_unprotect((vm_address_t)target, sourceSize);
 	if (kr != KERN_SUCCESS) return kr;
 
-	toHook[0] = _lth_arm64_gen_movk(16, targetAddr >>  0,  0);
-	toHook[1] = _lth_arm64_gen_movk(16, targetAddr >> 16, 16);
-	toHook[2] = _lth_arm64_gen_movk(16, targetAddr >> 32, 32);
-	toHook[3] = _lth_arm64_gen_movk(16, targetAddr >> 48, 48);
-	toHook[4] = _lth_arm64_gen_br(16);
-	uint32_t hookSize = 5 * sizeof(uint32_t);
+	litehook_memcpy(target, source, sourceSize);
 
-	kr = litehook_protect((vm_address_t)toHook, hookSize);
+	kr = litehook_protect((vm_address_t)target, sourceSize);
 	if (kr != KERN_SUCCESS) return kr;
 
-	sys_icache_invalidate(toHook, hookSize);
+	sys_icache_invalidate(target, sourceSize);
 
 	return KERN_SUCCESS;
+}
+
+kern_return_t (*litehook_hook_memory)(void *target, void *source, size_t sourceSize) = litehook_hook_memory_default;
+
+kern_return_t litehook_hook_function(void *source, void *target)
+{
+	void *sourceUnsigned = ptrauth_strip(source, ptrauth_key_function_pointer);
+	void *targetUnsigned = ptrauth_strip(target, ptrauth_key_function_pointer);
+
+	uint32_t hookBytes[] = {
+		_lth_arm64_gen_movk(16, (uint64_t)targetUnsigned >>  0,  0),
+		_lth_arm64_gen_movk(16, (uint64_t)targetUnsigned >> 16, 16),
+		_lth_arm64_gen_movk(16, (uint64_t)targetUnsigned >> 32, 32),
+		_lth_arm64_gen_movk(16, (uint64_t)targetUnsigned >> 48, 48),
+		_lth_arm64_gen_br(16),
+	};
+
+	return litehook_hook_memory(sourceUnsigned, hookBytes, sizeof(hookBytes));
 }
 
 const char *litehook_locate_dsc(void)
@@ -214,18 +232,48 @@ uintptr_t litehook_get_dsc_slide(void)
 	return slide;
 }
 
-void *_litehook_sign_if_executable(void *ptr)
+bool is_pointer_to_instructions(const mach_header_u *header, uintptr_t ptr)
 {
-	vm_address_t region = (vm_address_t)ptr;
-	vm_size_t region_len = 0;
-	struct vm_region_submap_short_info_64 info;
-	mach_msg_type_number_t info_count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
-	natural_t max_depth = 99999;
-	kern_return_t kr = vm_region_recurse_64(mach_task_self(), &region, &region_len, &max_depth, (vm_region_recurse_info_t)&info, &info_count);
-	if (info.protection & PROT_EXEC) {
-		return ptrauth_sign_unauthenticated(ptr, ptrauth_key_function_pointer, 0);
+	const struct load_command *lc =
+		(const struct load_command *)((const uint8_t *)header + sizeof(struct mach_header_64));
+
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		if (lc->cmd == LC_SEGMENT_64) {
+			const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+			const struct section_64 *sect =
+				(const struct section_64 *)((const uint8_t *)seg + sizeof(struct segment_command_64));
+
+			for (uint32_t s = 0; s < seg->nsects; s++, sect++) {
+				uint64_t sectStart = (uintptr_t)header + sect->addr;
+				uint64_t sectEnd   = sectStart + sect->size;
+
+				if ((ptr >= sect->addr) && (ptr < sectEnd)) {
+					uint32_t attrs = sect->flags & SECTION_ATTRIBUTES_USR;
+					return (attrs & S_ATTR_PURE_INSTRUCTIONS) ||
+						   (attrs & S_ATTR_SOME_INSTRUCTIONS);
+				}
+			}
+		}
+		lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
 	}
-	return ptr;
+
+	return false;
+}
+
+void *_litehook_sign_if_executable(void *ptr, const mach_header_u *optHeader)
+{
+	const mach_header_u *header = optHeader;
+	if (!header) {
+		Dl_info info;
+		if (!dladdr(ptr, &info)) { 
+			return ptr;
+		}
+		header = (const mach_header_u *)info.dli_fbase;
+	}
+	if (!is_pointer_to_instructions(header, (uintptr_t)ptr)) {
+		return ptr;
+	}
+	return ptrauth_sign_unauthenticated(ptr, ptrauth_key_function_pointer, 0);
 }
 
 void *litehook_find_symbol(const mach_header_u *header, const char *symbolName)
@@ -283,7 +331,7 @@ void *litehook_find_symbol(const mach_header_u *header, const char *symbolName)
 		}
 
 		if (!strcmp(curSymbolName, symbolName)) {
-			return _litehook_sign_if_executable((void *)((uintptr_t)header + symEntry->n_value));
+			return _litehook_sign_if_executable((void *)((uintptr_t)header + symEntry->n_value), header);
 		}
 	}
 
@@ -423,7 +471,7 @@ void *litehook_find_dsc_symbol(const char *imagePath, const char *symbolName)
 		char curSymbolName[len+1];
 		if (fread(curSymbolName, len+1, 1, symbolDSC) != 1) goto end;
 		if (!strcmp(curSymbolName, symbolName)) {
-			symbol = _litehook_sign_if_executable((void *)(litehook_get_dsc_slide() + n.n_value));
+			symbol = _litehook_sign_if_executable((void *)(litehook_get_dsc_slide() + n.n_value), NULL);
 		}
 	}
 
