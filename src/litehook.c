@@ -345,7 +345,7 @@ void *litehook_find_symbol(const mach_header_u *header, const char *symbolName)
 
 		if (!strcmp(curSymbolName, symbolName)) {
 			if (slide == -1) slide = 0;
-			return _litehook_sign_if_executable((void *)((uintptr_t)header + (symEntry->n_value - vmBase)), header);
+			return _litehook_sign_if_executable((void *)((uintptr_t)header + (symEntry->n_value - vmBase)), slide, header);
 		}
 	}
 
